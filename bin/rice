@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Open the riced tmux layout: animated fetch pane left, shell right.
+# Reuses the "main" session if no other terminal is showing it,
+# otherwise every new terminal window gets its own fresh layout.
+new_layout() {
+  tmux new-session -d -s "$1" -n home -c "$HOME"
+  tmux split-window -h -b -l 42% -t "$1:1" -c "$HOME" "$HOME/.local/bin/fetch-pane"
+  tmux select-pane -t "$1:1.1" -T sysinfo
+  tmux select-pane -t "$1:1.2"
+}
+S=main
+if tmux has-session -t "$S" 2>/dev/null; then
+  if [ "$(tmux display -p -t "$S" '#{session_attached}')" != 0 ]; then
+    S="term-$$"; new_layout "$S"
+    # throwaway session: dies when its terminal window is closed
+    exec tmux attach -t "$S" \; set destroy-unattached on
+  fi
+else
+  new_layout "$S"
+fi
+exec tmux attach -t "$S"

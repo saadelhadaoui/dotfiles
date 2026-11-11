@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+"""Animated fastfetch pane: ASCII Hollow Knight matched from real art (or the gif, in kitty: --gif), fastfetch info,
+weather / prayer times / location, live stats."""
+import datetime, json, math, os, re, shutil, signal, subprocess, sys, threading, time, unicodedata, urllib.request
+
+FPS = 12
+CONF = os.path.expanduser("~/.config/fastfetch/pane.jsonc")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+SPARK = "▁▂▃▄▅▆▇█"
+# hollow knight: pale shell, soul blue, dream purple, lifeblood, greenpath, geo, hornet red
+PALE, BLUE, DREAM, LIFEBLOOD = (242, 240, 234), (143, 176, 236), (182, 163, 232), (94, 200, 216)
+GREEN, YELLOW, RED, SUB, SURF = (127, 174, 110), (229, 180, 90), (192, 57, 63), (110, 120, 145), (31, 36, 51)
+
+
+def fg(c):
+    return "\x1b[38;2;%d;%d;%dm" % c
+
+
+def mix(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def clip(s, width):
+    """Truncate a string with ANSI codes to `width` visible chars."""
+    out, n, i = [], 0, 0
+    while i < len(s) and n < width:
+        m = ANSI.match(s, i)
+        if m:
+            out.append(m.group()); i = m.end(); continue
+        out.append(s[i]); n += not unicodedata.combining(s[i]); i += 1
+    return "".join(out) + "\x1b[0m"
+
+
+# ── static info (refreshed every minute) ──────────────────
+def fetch_info():
+    try:
+        out = subprocess.run(["fastfetch", "-c", CONF], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return [], ""
+    lines = [l for l in out.splitlines() if ANSI.sub("", l).strip()]
+    return lines[1:], ANSI.sub("", lines[0]).strip() if lines else ""
+
+
+# ── live stats ────────────────────────────────────────────
+class Stats:
+    def __init__(self):
+        self.prev = self._cpu_raw(); self.hist = []; self.cpu = 0
+
+    @staticmethod
+    def _cpu_raw():
+        with open("/proc/stat") as f:
+            v = list(map(int, f.readline().split()[1:9]))
+        return sum(v), v[3] + v[4]
+
+    def sample(self):
+        tot, idle = self._cpu_raw()
+        dt, di = tot - self.prev[0], idle - self.prev[1]
+        self.prev = (tot, idle)
+        if dt > 0:
+            self.cpu = max(0, min(100, round(100 * (dt - di) / dt)))
+        self.hist = (self.hist + [self.cpu])[-60:]
+
+    @staticmethod
+    def mem():
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":"); info[k] = int(v.split()[0])
+        used = info["MemTotal"] - info["MemAvailable"]
+        return used / info["MemTotal"], used / 1048576, info["MemTotal"] / 1048576
+
+    @staticmethod
+    def battery():
+        b = "/sys/class/power_supply/BAT0"
+        try:
+            return int(open(b + "/capacity").read()), open(b + "/status").read().strip()
+        except OSError:
+            return None, None
+
+    _temp_path = next((os.path.join(h, "temp1_input") for h in (os.path.join("/sys/class/hwmon", d) for d in sorted(os.listdir("/sys/class/hwmon")))
+                       if open(os.path.join(h, "name")).read().strip() == "coretemp"), None)
+
+    @classmethod
+    def temp(cls):
+        try:
+            return int(open(cls._temp_path).read()) // 1000  # coretemp "Package id 0"
+        except (OSError, TypeError):
+            return None
+
+    @staticmethod
+    def uptime():
+        s = int(float(open("/proc/uptime").read().split()[0]))
+        d, h, m = s // 86400, s // 3600 % 24, s // 60 % 60
+        return (f"{d}d " if d else "") + f"{h}h {m:02d}m"
+
+
+def level_color(p):
+    return GREEN if p < 0.5 else YELLOW if p < 0.8 else RED
+
+
+def bar3d(frac, width, color, t, charging=False):
+    """Raised bar: bright top-lit fill, shaded edge, recessed track."""
+    fill = frac * width
+    full = int(fill)
+    s = ""
+    for i in range(width):
+        if i < full:
+            # subtle moving highlight across the fill
+            glow = 0.35 * max(0, math.cos((i / max(width, 1)) * 6 - t * 3)) if charging else 0.12 * math.cos(i * 0.4 - t * 2)
+            s += fg(mix(color, (255, 255, 255), max(0, glow))) + "█"
+        elif i == full and fill - full > 0.01:
+            s += fg(color) + "▓▒░"[min(2, int((1 - (fill - full)) * 3))]
+        else:
+            s += fg(SURF) + "░"
+    return s + "\x1b[0m"
+
+
+# ── animated ASCII Knight from the real art ─────────────────
+# Every cell gets the character whose actual glyph shape (Noto Sans Mono, the Konsole font) best
+# fits that patch of the picture, plus least-squares fg/bg colours: edge cells keep the terminal
+# background, interior cells get both colours. Frames loop every LOOP s and are cached.
+ART = os.path.expanduser("~/.local/share/fetch-pane/knight.png")
+FONT = "/usr/share/fonts/google-noto/NotoSansMono-Regular.ttf"
+SX, SY = 4, 9          # samples per cell; cells are ~2.25x taller than wide
+LOOP = 4.0             # s: one bob, two cloak ripples, motes rise once or twice
+BG = (11, 13, 22)      # pane background (#0b0d16)
+LIFT = (40, 44, 62)    # black ink is lifted to slate so the body shows on the abyss background
+QUADS = {"▘": "1000", "▝": "0100", "▖": "0010", "▗": "0001", "▚": "1001", "▞": "0110", "▀": "1100", "▄": "0011",
+         "▌": "1010", "▐": "0101", "▛": "1110", "▜": "1101", "▙": "1011", "▟": "0111"}
+
+
+def glyph_masks():
+    """(char, mask[SX*SY] in 0..1, sum m, sum m^2) for line-like ASCII + quadrant blocks.
+    Letters and digits are left out: they win on raw error in textured areas but read as noise."""
+    from PIL import Image, ImageDraw, ImageFont
+    font = ImageFont.truetype(FONT, 72)
+    asc, desc = font.getmetrics()
+    cw, ch = round(font.getlength("M")), asc + desc
+    out = []
+    for c in ".,:;'\"`^~-_=+*/\\|()<>[]{}!":
+        im = Image.new("L", (cw, ch))
+        ImageDraw.Draw(im).text((0, 0), c, font=font, fill=255)
+        out.append((c, [v / 255 for v in im.resize((SX, SY), Image.BOX).getdata()]))
+    for c, q in QUADS.items():  # terminals draw block elements exactly, so their masks are ideal
+        m = []
+        for y in range(SY):
+            top = max(0.0, min(1.0, SY / 2 - y))
+            for x in range(SX):
+                left = x < SX / 2
+                m.append(top * int(q[0 if left else 1]) + (1 - top) * int(q[2 if left else 3]))
+        out.append((c, m))
+    return [(c, m, sum(m), sum(v * v for v in m)) for c, m in out]
+
+
+class KnightArt:
+    def __init__(self):
+        from PIL import Image, ImageFilter
+        self.Image = Image
+        src = Image.open(ART).convert("RGBA")
+        lift = lambda c: tuple(int(c[i] + (1 - c[i] / 255) * LIFT[i]) for i in range(3))
+        # split the cloak strands (blue-grey + their dark lines) from everything else so they can ripple
+        px = src.load()
+        blue = Image.new("L", src.size)
+        bp = blue.load()
+        for y in range(src.height):
+            for x in range(src.width):
+                r, g, b, a = px[x, y]
+                if a > 100 and b - r >= 6 and 45 <= (r + g + b) / 3 < 150:
+                    bp[x, y] = 255
+        near = blue.filter(ImageFilter.MaxFilter(5))
+        self.cloak, self.rest = Image.new("RGBA", src.size), Image.new("RGBA", src.size)
+        cp, rp, npx = self.cloak.load(), self.rest.load(), near.load()
+        for y in range(src.height):
+            for x in range(src.width):
+                r, g, b, a = px[x, y]
+                rgb = lift((r, g, b))
+                dark_strand = npx[x, y] and (r + g + b) / 3 < 150
+                (cp if dark_strand else rp)[x, y] = rgb + (a,)
+        self.aspect = src.width / src.height
+        self.glyphs = glyph_masks()
+        self.key, self.frames, self.lock = None, {}, threading.Lock()
+
+    def rows(self, W, th, t):
+        th = min(th, 30)
+        tw = min(W - 2, int(th * SY * self.aspect / SX))
+        th = min(th, int(tw * SX / self.aspect / SY))
+        if (tw, th) != self.key:
+            self.key = (tw, th)
+            try:  # rendered before at this size: load instead of re-rendering (that work ran the CPU to ~97°C)
+                with self.lock:
+                    self.frames = dict(enumerate(json.load(open(self._cache(tw, th)))))
+            except (OSError, ValueError):
+                with self.lock:
+                    self.frames = {0: self._frame(tw, th, 0)}
+                threading.Thread(target=self._fill, args=((tw, th),), daemon=True).start()
+        n = int(LOOP * FPS)
+        i = int(t * FPS) % n
+        while i not in self.frames:  # first loop: show the newest frame rendered so far
+            i = (i - 1) % n
+        return self.frames[i], tw
+
+    def _cache(self, tw, th):
+        # stamp = art + script versions, so editing either re-renders
+        return os.path.join(CACHE, "knightart-%dx%d-%d-%d.json" % (tw, th, os.path.getmtime(ART), os.path.getmtime(__file__)))
+
+    def _fill(self, key):
+        for i in range(1, int(LOOP * FPS)):
+            if self.key != key:
+                return
+            t0 = time.time()
+            f = self._frame(*key, i)
+            with self.lock:
+                if self.key == key:
+                    self.frames[i] = f
+            time.sleep(2 * (time.time() - t0))  # ~1/3 duty cycle: no turbo heat spike while rendering
+        os.makedirs(CACHE, exist_ok=True)
+        path = self._cache(*key)
+        stamp = os.path.basename(path).split("-", 2)[2]  # "<art mtime>-<script mtime>.json"
+        for old in os.listdir(CACHE):  # drop caches from older art/script versions
+            if old.startswith("knightart-") and not old.endswith(stamp):
+                os.remove(os.path.join(CACHE, old))
+        with self.lock:
+            json.dump([self.frames[i] for i in range(len(self.frames))], open(path, "w"))
+
+    def _frame(self, tw, th, i):
+        Image = self.Image
+        ph = 2 * math.pi * i / (LOOP * FPS)
+        w, h = tw * SX, th * SY
+        pad = 3  # sample rows of headroom for the bob
+        size = (w, h - 2 * pad)
+        # cloak ripple: each row shifts sideways, a travelling wave down the strands
+        cloak, rest = self.cloak.resize(size, Image.LANCZOS), self.rest.resize(size, Image.LANCZOS)
+        rip = Image.new("RGBA", size)
+        for y in range(size[1]):
+            dx = round(1.6 * math.sin(2 * ph - y * 0.09))
+            rip.paste(cloak.crop((0, y, size[0], y + 1)), (dx, y))
+        fig = Image.alpha_composite(rip, rest)
+        canvas = Image.new("RGBA", (w, h))
+        canvas.paste(fig, (0, pad))
+        bob = 2.2 * math.sin(ph)
+        canvas = canvas.transform((w, h), Image.AFFINE, (1, 0, 0, 0, 1, -bob), Image.BILINEAR)
+        data = canvas.load()
+
+        bgl = sum(BG) / 3
+        n = SX * SY
+        cells = []
+        for cy in range(th):
+            row = []
+            for cx in range(tw):
+                rgb, L, al = [], [], []
+                for y in range(cy * SY, cy * SY + SY):
+                    for x in range(cx * SX, cx * SX + SX):
+                        r, g, b, a = data[x, y]
+                        a /= 255
+                        c = (r * a + BG[0] * (1 - a), g * a + BG[1] * (1 - a), b * a + BG[2] * (1 - a))
+                        rgb.append(c); L.append(sum(c) / 3); al.append(a)
+                amean = sum(al) / n
+                if amean < 0.06:
+                    row.append(None); continue
+                free = min(al) > 0.97  # fully inside the figure: fit both colours
+                SL, SLL = sum(L), sum(v * v for v in L)
+                best, best_err = None, float("inf")
+                for g in self.glyphs:
+                    c, m, Sm, Smm = g
+                    SmL = sum(map(float.__mul__, m, L))
+                    if free:
+                        den = n * Smm - Sm * Sm
+                        if den < 1e-6:
+                            continue
+                        b1 = (n * SmL - Sm * SL) / den
+                        b0 = (SL - b1 * Sm) / n
+                        err = SLL - b0 * SL - b1 * SmL
+                    else:
+                        d = SmL - bgl * Sm
+                        err = (SLL - 2 * bgl * SL + n * bgl * bgl) - d * d / Smm
+                    if err < best_err:
+                        best, best_err = g, err
+                if free:
+                    flat = SLL - SL * SL / n  # a plain full block beats any glyph on flat patches
+                    if flat <= best_err + 1e-6:
+                        row.append(("█", tuple(int(sum(p[k] for p in rgb) / n) for k in range(3)), None)); continue
+                c, m, Sm, Smm = best
+                if free:
+                    den = n * Smm - Sm * Sm
+                    fg, bgc = [], []
+                    for k in range(3):
+                        S = sum(p[k] for p in rgb)
+                        Smc = sum(mi * p[k] for mi, p in zip(m, rgb))
+                        b1 = (n * Smc - Sm * S) / den
+                        b0 = (S - b1 * Sm) / n
+                        fg.append(b0 + b1); bgc.append(b0)
+                else:
+                    fg = [BG[k] + (sum(mi * p[k] for mi, p in zip(m, rgb)) - BG[k] * Sm) / Smm for k in range(3)]
+                    bgc = None
+                clamp = lambda v: tuple(max(0, min(255, int(x))) for x in v)
+                row.append((c, clamp(fg), clamp(bgc) if bgc else None))
+            cells.append(row)
+
+        # soul motes drifting up through empty cells (periodic with the loop)
+        rnd = __import__("random").Random(11)
+        for _ in range(max(6, tw // 4)):
+            x0, ph0, k = rnd.random(), rnd.random(), rnd.choice((1, 2))
+            u = (k * i / (LOOP * FPS) + ph0) % 1
+            y = int((1 - u) * th)
+            x = int(x0 * tw + 1.2 * math.sin(2 * math.pi * (u + ph0)))
+            if 0 <= y < th and 0 <= x < tw and cells[y][x] is None:
+                glow = math.sin(math.pi * u)
+                cells[y][x] = ("·" if glow < 0.6 else "∙", mix(SURF, BLUE, glow), None)
+
+        out = []
+        for row in cells:
+            parts, state = [], None
+            for cell in row:
+                if cell is None:
+                    if state is not None:
+                        parts.append("\x1b[0m"); state = None
+                    parts.append(" "); continue
+                c, f, b = cell
+                st = (f, b)
+                if st != state:
+                    parts.append("\x1b[38;2;%d;%d;%d" % f + (";48;2;%d;%d;%dm" % b if b else ";49m")); state = st
+                parts.append(c)
+            out.append("".join(parts) + "\x1b[0m")
+        return out
+
+
+# ── real-pixel gif for kitty (fetch-pane --gif) ──────────────
+# Frames go to kitty once through tmux passthrough; kitty animates them itself, and the pane
+# only holds unicode placeholder cells, so nothing is redrawn per frame.
+GIF = os.path.expanduser("~/.local/share/fetch-pane/knight.gif")
+CACHE = os.path.expanduser("~/.cache/fetch-pane")
+DIACRITICS = ("̅̍̎̐̒̽̾̿͆͊͋͌͐͑͒͗͛ͣͤ"
+              "ͥͦͧͨͩͪͫͬͭͮͯ҃҄҅҆҇֒֓֔"
+              "֕֗֘֙֜֝֞֟֠֡֨֩֫֬֯ׄؐؑؒؓ")
+
+
+def kitty_client():
+    try:
+        r = subprocess.run(["tmux", "display", "-p", "#{client_termname} #{client_cell_width} #{client_cell_height}"],
+                           capture_output=True, text=True, timeout=1).stdout.split()
+        return (int(r[1]), int(r[2])) if r and r[0] == "xterm-kitty" else None
+    except Exception:
+        return None
+
+
+def _apc(cmd, data=b""):
+    seq = "\x1b_G" + cmd + (";" + data.decode() if data else "") + "\x1b\\"
+    return "\x1bPtmux;" + seq.replace("\x1b", "\x1b\x1b") + "\x1b\\"
+
+
+class KittyGif:
+    ID = 77  # also the placeholder fg colour (38;5;77), which is how kitty finds the image
+
+    def __init__(self, path, cell):
+        from PIL import Image
+        self.im, self.cell, self.key, self.sent = Image.open(path), cell, None, False
+        self.aspect = self.im.width / self.im.height
+
+    def _transmit(self):
+        import base64, io
+        os.makedirs(CACHE, exist_ok=True)
+        blob = os.path.join(CACHE, "knight-%d.kitty" % int(os.path.getmtime(GIF)))
+        if not os.path.exists(blob):
+            out = [_apc("a=d,d=I,i=%d,q=2" % self.ID)]
+            for n in range(self.im.n_frames):
+                self.im.seek(n)
+                buf = io.BytesIO(); self.im.convert("RGB").quantize(128).save(buf, "PNG")  # palette PNG: ~half the bytes
+                data = base64.b64encode(buf.getvalue())
+                head = ("a=t,f=100,i=%d" if n == 0 else "a=f,f=100,i=%d,z=" + str(self.im.info.get("duration") or 50)) % self.ID
+                for c in range(0, len(data), 4096):
+                    more = int(c + 4096 < len(data))
+                    out.append(_apc((head + ",q=2,m=%d" if c == 0 else "q=2,m=%d") % more, data[c:c + 4096]))
+            out.append(_apc("a=a,i=%d,r=1,z=%d,q=2" % (self.ID, self.im.info.get("duration") or 50)))
+            open(blob, "w").write("".join(out))
+        sys.stdout.write(open(blob).read())
+
+    def rows(self, W, th, t):
+        cw, ch = self.cell
+        tw = min(W - 2, int(th * ch * self.aspect / cw))
+        th = min(len(DIACRITICS), int(tw * cw / self.aspect / ch))
+        if not self.sent:
+            self._transmit(); self.sent = True
+        if (tw, th) != self.key:
+            self.key = (tw, th)
+            sys.stdout.write(_apc("a=p,U=1,i=%d,c=%d,r=%d,q=2" % (self.ID, tw, th)) + _apc("a=a,i=%d,s=3,v=1,q=2" % self.ID))
+            # first cell of a row names row+col; the rest are inferred left-to-right
+            self.out = ["\x1b[38;5;%dm\U0010eeee%s%s%s\x1b[39m" % (self.ID, DIACRITICS[r], DIACRITICS[0], "\U0010eeee" * (tw - 1)) for r in range(th)]
+        return self.out, tw
+
+
+# ── the world above Hallownest: location, weather, prayer times ──
+# Fetched in a background thread and cached in ~/.cache/fetch-pane, so the animation never waits
+# on the network and the last known values still show offline.
+WORLD_CACHE = os.path.expanduser("~/.cache/fetch-pane")
+PRAYERS = ("Fajr", "Dhuhr", "Asr", "Maghrib", "Isha")
+PRAYER_METHOD = int(os.environ.get("PRAYER_METHOD", 3))  # AlAdhan calculation method id (3 = Muslim World League); see aladhan.com/calculation-methods
+# WMO weather code ceiling -> (words, glyph, the Hallownest area it feels like)
+WEATHER = [(1, "clear", "☀", "Howling Cliffs"), (3, "cloudy", "☁", "Forgotten Crossroads"), (48, "fog", "≋", "Fog Canyon"),
+           (57, "drizzle", "☂", "Greenpath"), (67, "rain", "☂", "City of Tears"), (77, "snow", "❄", "Crystal Peak"),
+           (82, "showers", "☂", "City of Tears"), (86, "snow showers", "❄", "Crystal Peak"), (99, "storm", "ϟ", "Kingdom's Edge")]
+
+
+def _get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "fetch-pane"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)
+
+
+class World:
+    def __init__(self):
+        os.makedirs(WORLD_CACHE, exist_ok=True)
+        self.d = {}
+        for k in ("loc", "weather", "prayer"):
+            try:
+                self.d[k] = json.load(open(os.path.join(WORLD_CACHE, k + ".json")))
+            except (OSError, ValueError):
+                pass
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _save(self, k, v):
+        v["ts"] = time.time()
+        self.d[k] = v
+        json.dump(v, open(os.path.join(WORLD_CACHE, k + ".json"), "w"))
+
+    def _refresh(self):
+        now, today = time.time(), datetime.date.today().strftime("%d-%m-%Y")
+        if now - self.d.get("loc", {}).get("ts", 0) > 86400:
+            j = _get("https://ipinfo.io/json")  # shortcut: IP geolocation; wrong behind a VPN
+            lat, lon = j["loc"].split(",")
+            self._save("loc", {"city": j.get("city", "?"), "country": j.get("country", ""), "lat": lat, "lon": lon})
+        loc = self.d["loc"]
+        if now - self.d.get("weather", {}).get("ts", 0) > 900:
+            j = _get("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&timezone=auto&forecast_days=1"
+                     "&current=temperature_2m,apparent_temperature,weather_code,relative_humidity_2m,wind_speed_10m,is_day"
+                     "&daily=temperature_2m_max,temperature_2m_min" % (loc["lat"], loc["lon"]))
+            self._save("weather", {"cur": j["current"], "max": j["daily"]["temperature_2m_max"][0], "min": j["daily"]["temperature_2m_min"][0]})
+        if self.d.get("prayer", {}).get("date") != today:
+            j = _get("https://api.aladhan.com/v1/timings/%s?latitude=%s&longitude=%s&method=%d" % (today, loc["lat"], loc["lon"], PRAYER_METHOD))["data"]
+            h = j["date"]["hijri"]
+            self._save("prayer", {"date": today, "times": {p: j["timings"][p][:5] for p in PRAYERS},
+                                  "hijri": "%s %s %s" % (h["day"], h["month"]["en"], h["year"])})
+
+    def _loop(self):
+        while True:
+            try:
+                self._refresh()
+            except Exception:
+                pass  # offline / API hiccup: keep showing the cached values, retry in a minute
+            time.sleep(60)
+
+    def rows(self, t):
+        txt = fg((220, 223, 232))
+        out = []
+        loc, w, pr = self.d.get("loc"), self.d.get("weather"), self.d.get("prayer")
+        today = datetime.date.today().strftime("%d-%m-%Y")
+        if loc:
+            hijri = fg(SUB) + "  ·  " + fg(DREAM) + pr["hijri"] if pr and pr.get("date") == today else ""
+            out.append(label("realm") + txt + "%s, %s" % (loc["city"], loc["country"]) + hijri + "\x1b[0m")
+        if w:
+            c = w["cur"]
+            words, glyph, area = next((x[1:] for x in WEATHER if c["weather_code"] <= x[0]), WEATHER[-1][1:])
+            if not c["is_day"] and c["weather_code"] <= 1:
+                glyph, area = "☾", "Resting Grounds"
+            out.append(label("skies") + fg(BLUE) + glyph + " " + txt + "%d°C %s" % (round(c["temperature_2m"]), words)
+                       + fg(SUB) + "  ·  feels %d°  ↓%d° ↑%d°  ·  %d%%  %d km/h  ·  " % (
+                           round(c["apparent_temperature"]), round(w["min"]), round(w["max"]), c["relative_humidity_2m"], round(c["wind_speed_10m"]))
+                       + fg(LIFEBLOOD) + "\x1b[3m" + area + "\x1b[0m")
+        if pr and pr.get("date") == today:
+            now = datetime.datetime.now()
+            at = {p: datetime.datetime.combine(now.date(), datetime.time(*map(int, pr["times"][p].split(":")))) for p in PRAYERS}
+            nxt = next((p for p in PRAYERS if at[p] > now), "Fajr")
+            when = at[nxt] if at[nxt] > now else at["Fajr"] + datetime.timedelta(days=1)  # after Isha: tomorrow's Fajr (approx.)
+            parts = []
+            for p in PRAYERS:
+                col = YELLOW if p == nxt else SUB if at[p] <= now else (220, 223, 232)
+                parts.append(fg(col) + ("\x1b[1m" if p == nxt else "") + "%s %s" % (p, pr["times"][p]) + "\x1b[22m")
+            out.append(label("prayer") + "  ".join(parts) + "\x1b[0m")
+            mins = int((when - now).total_seconds() // 60)
+            out.append(label("next") + fg(YELLOW) + "❦ " + wave_text("%s in %dh %02dm" % (nxt, mins // 60, mins % 60), t, YELLOW, PALE))
+        if out:
+            out.insert(0, fg(SUB) + "❦ " + wave_text("hallownest", t, YELLOW, PALE) + " " + "".join(
+                fg(mix(SURF, YELLOW, (math.sin(t * 3 - i * 0.25) + 1) / 2 * 0.6)) + "─" for i in range(32)) + "\x1b[0m")
+        return out
+
+
+# ── frame composition ─────────────────────────────────────
+def wave_text(text, t, a=PALE, b=BLUE):
+    return "".join(fg(mix(a, b, (math.sin(t * 2.5 - i * 0.35) + 1) / 2)) + ch for i, ch in enumerate(text)) + "\x1b[0m"
+
+
+def label(k):
+    return fg(SUB) + k.ljust(8) + "\x1b[0m"
+
+
+def frame(W, H, t, info, title, st, art, world):
+    live = []
+    # cpu sparkline fills the width
+    gw = max(10, W - 18)
+    hist = ([0] * gw + st.hist)[-gw:]
+    spark = "".join(fg(level_color(v / 100)) + SPARK[min(7, v * 8 // 101)] for v in hist)
+    live.append(label("cpu") + spark + fg((220, 223, 232)) + f" {st.cpu:3d}%\x1b[0m")
+    frac, used, total = st.mem()
+    live.append(label("ram") + bar3d(frac, gw, level_color(frac), t) + fg((220, 223, 232)) + f" {used:4.1f}G\x1b[0m")
+    cap, status = st.battery()
+    if cap is not None:
+        ch = status == "Charging"
+        icon = ("ϟ" if int(t * 2) % 2 else " ") if ch else ("!" if cap <= 15 and int(t * 2) % 2 else " ")
+        live.append(label("battery") + bar3d(cap / 100, gw, level_color(1 - cap / 100), t, ch) + fg((220, 223, 232)) + f" {cap:3d}%{icon}\x1b[0m")
+    temp = st.temp()
+    if temp is not None:  # 30°C cold .. 100°C hot
+        heat = max(0, min(1, (temp - 30) / 70))
+        live.append(label("heat") + bar3d(heat, gw, level_color(heat), t) + fg((220, 223, 232)) + f" {temp:3d}°C\x1b[0m")
+    clock = time.strftime("%H:%M:%S")
+    live.append(label("uptime") + fg((220, 223, 232)) + st.uptime() + " " * max(1, gw - len(st.uptime()) - len(clock) + 5) + wave_text(clock, t, BLUE, LIFEBLOOD))
+
+    head = ["  " + wave_text(title, t), "  " + "".join(
+        fg(mix(SURF, PALE, (math.sin(t * 3 - i * 0.25) + 1) / 2 * 0.8)) + "─" for i in range(max(0, min(W - 4, 44)))) + "\x1b[0m"]
+    body = ["  " + l for l in info]
+    sky = world.rows(t)
+    fixed = len(head) + len(body) + len(live) + 3 + (len(sky) + 1 if sky else 0)
+    th = max(0, min(28, H - fixed))
+    rows = []
+    if art and th >= 6:
+        art_rows, tw = art.rows(W, th, t)
+        pad = " " * max(0, (W - tw) // 2)
+        rows += [pad + r for r in art_rows]
+    rows += [""] + head + body + [""] + (["  " + l for l in sky] + [""] if sky else []) + ["  " + l for l in live]
+    rows += [""] * max(0, H - len(rows))
+    return [clip(r, W) + "\x1b[K" for r in rows[:H]]
+
+
+def attached():
+    try:
+        r = subprocess.run(["tmux", "display", "-p", "#{session_attached}"], capture_output=True, text=True, timeout=1)
+        return r.stdout.strip() not in ("0", "")
+    except Exception:
+        return True
+
+
+def main():
+    sys.stdout.write("\x1b[?25l\x1b[2J")
+    resized = [True]
+    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    info, title = fetch_info()
+    st, start, world = Stats(), time.time(), World()
+    cell = kitty_client() if "--gif" in sys.argv and os.path.exists(GIF) else None
+    art = KittyGif(GIF, cell) if cell else KnightArt() if os.path.exists(ART) else None  # no art image: info only
+    prev = []
+    last_info = last_sample = last_check = 0
+    awake = True
+    try:
+        while True:
+            now = time.time()
+            if now - last_check > 3:
+                awake, last_check = attached() if os.environ.get("TMUX") else True, now
+            if not awake:
+                time.sleep(1); continue
+            if now - last_info > 60:
+                info, title = fetch_info(); last_info = now
+            if now - last_sample > 0.5:
+                st.sample(); last_sample = now
+            if resized[0]:
+                resized[0] = False; sys.stdout.write("\x1b[2J"); prev = []
+            W, H = shutil.get_terminal_size()
+            rows = frame(W, H, now - start, info, title, st, art, world)
+            # only rewrite changed rows, inside a synchronized update, so the terminal never
+            # paints a half-drawn frame (that is what made the shell cursor flicker/jump)
+            diff = "".join("\x1b[%dH%s" % (i + 1, r) for i, r in enumerate(rows) if i >= len(prev) or prev[i] != r)
+            prev = rows
+            sys.stdout.write("\x1b[?2026h" + diff + "\x1b[?2026l")
+            sys.stdout.flush()
+            time.sleep(max(0, 1 / FPS - (time.time() - now)))
+    finally:
+        sys.stdout.write("\x1b[0m\x1b[?25h")
+
+
+if __name__ == "__main__":
+    main()
